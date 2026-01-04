@@ -2,7 +2,6 @@
 
 const fs = require('fs');
 const cheerio = require('cheerio');
-const request = require('request');
 
 const refUrl = 'https://developer.mozilla.org/en-US/docs/Web/HTML/Element';
 const dataPath = './data/elements.txt';
@@ -22,7 +21,8 @@ function extractElements($) {
         'noframes',
         // experimental, don't add yet
         'portal',
-        'fencedframe'
+        'fencedframe',
+        'selectedcontent'
     ];
     // `<section>` is for some reason missing from the reference tables.
     const addElements = [
@@ -62,14 +62,21 @@ function extractElements($) {
         }, []);
 }
 
-request(refUrl, (error, response, html) => {
-    if (error) {
+fetch(refUrl)
+    .then(response => {
+        if (!response.ok) {
+            throw new Error(`HTTP error! status: ${response.status}`);
+        }
+        return response.text();
+    })
+    .then(html => {
+        const $ = cheerio.load(html);
+        const elements = extractElements($);
+        const out = elements.join('\n');
+
+        fs.writeFileSync(dataPath, out);
+    })
+    .catch(error => {
         console.error(error);
         process.exit(-1);
-    }
-    const $ = cheerio.load(html);
-    const elements = extractElements($);
-    const out = elements.join('\n');
-
-    fs.writeFileSync(dataPath, out);
-});
+    });

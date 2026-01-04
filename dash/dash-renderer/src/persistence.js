@@ -70,6 +70,7 @@ import {createAction} from 'redux-actions';
 
 import Registry from './registry';
 import {stringifyId} from './actions/dependencies';
+import {isDryComponent} from './wrapper/wrapping';
 
 export const storePrefix = '_dash_persistence.';
 
@@ -290,7 +291,9 @@ const getProps = layout => {
     const {id, persistence} = props;
 
     const element = Registry.resolve(layout);
-    const getVal = prop => props[prop] || (element.defaultProps || {})[prop];
+    const getVal = prop =>
+        props[prop] ||
+        (element.defaultProps || element.dashPersistence || {})[prop];
     const persisted_props = getVal('persisted_props');
     const persistence_type = getVal('persistence_type');
     const canPersist = id && persisted_props && persistence_type;
@@ -316,7 +319,14 @@ export function recordUiEdit(layout, newProps, dispatch) {
         persisted_props,
         persistence_type
     } = getProps(layout);
-    if (!canPersist || !persistence) {
+
+    // if the "persistence" property is changed as a callback output,
+    // skip the persistence storage overwriting.
+    const isPersistenceMismatch =
+        newProps?.persistence !== undefined &&
+        newProps.persistence !== persistence;
+
+    if (!canPersist || !persistence || isPersistenceMismatch) {
         return;
     }
 
@@ -352,10 +362,11 @@ export function recordUiEdit(layout, newProps, dispatch) {
  * callbacks) to apply previously-stored UI edits to components
  */
 export function applyPersistence(layout, dispatch) {
-    if (type(layout) !== 'Object' || !layout.props) {
-        return layout;
+    if (Array.isArray(layout)) {
+        return layout.map(lay =>
+            isDryComponent(lay) ? persistenceMods(lay, lay, [], dispatch) : lay
+        );
     }
-
     return persistenceMods(layout, layout, [], dispatch);
 }
 
@@ -499,46 +510,21 @@ export function prunePersistence(layout, newProps, dispatch) {
         depersistedProps = mergeRight(props, update);
     }
 
-    if (finalPersistence) {
+    if (finalPersistence && persistenceChanged) {
         const finalStorage = getStore(finalPersistenceType, dispatch);
-
-        if (persistenceChanged) {
-            // apply new persistence
-            forEach(
-                persistedProp =>
-                    modProp(
-                        getValsKey(id, persistedProp, finalPersistence),
-                        finalStorage,
-                        element,
-                        depersistedProps,
-                        persistedProp,
-                        update
-                    ),
-                filter(notInNewProps, finalPersistedProps)
-            );
-        }
-
-        // now the main point - clear any edit of a prop that changed
-        // note that this is independent of the new prop value.
-        const transforms = element.persistenceTransforms || {};
-        for (const propName in newProps) {
-            const propTransforms = transforms[propName];
-            if (propTransforms) {
-                for (const propPart in propTransforms) {
-                    finalStorage.removeItem(
-                        getValsKey(
-                            id,
-                            `${propName}.${propPart}`,
-                            finalPersistence
-                        )
-                    );
-                }
-            } else {
-                finalStorage.removeItem(
-                    getValsKey(id, propName, finalPersistence)
-                );
-            }
-        }
+        // apply new persistence
+        forEach(
+            persistedProp =>
+                modProp(
+                    getValsKey(id, persistedProp, finalPersistence),
+                    finalStorage,
+                    element,
+                    depersistedProps,
+                    persistedProp,
+                    update
+                ),
+            filter(notInNewProps, finalPersistedProps)
+        );
     }
     return persistenceChanged ? mergeRight(newProps, update) : newProps;
 }

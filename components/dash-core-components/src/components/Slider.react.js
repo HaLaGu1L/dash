@@ -157,6 +157,11 @@ Slider.propTypes = {
     verticalHeight: PropTypes.number,
 
     /**
+     * If the value is true, it means the component is rendered reverse.
+     */
+    reverse: PropTypes.bool,
+
+    /**
      * Additional CSS class for the root DOM node
      */
     className: PropTypes.string,
@@ -172,24 +177,6 @@ Slider.propTypes = {
      * Dash-assigned callback that gets fired when the value or drag_value changes.
      */
     setProps: PropTypes.func,
-
-    /**
-     * Object that holds the loading state object coming from dash-renderer
-     */
-    loading_state: PropTypes.shape({
-        /**
-         * Determines if the component is loading or not
-         */
-        is_loading: PropTypes.bool,
-        /**
-         * Holds which property is loading
-         */
-        prop_name: PropTypes.string,
-        /**
-         * Holds the name of the component that is loading
-         */
-        component_name: PropTypes.string,
-    }),
 
     /**
      * Used to allow user interactions in this component to be persisted when
@@ -226,6 +213,7 @@ Slider.defaultProps = {
     persisted_props: ['value'],
     persistence_type: 'local',
     verticalHeight: 400,
+    reverse: false,
 };
 
 export const propTypes = Slider.propTypes;

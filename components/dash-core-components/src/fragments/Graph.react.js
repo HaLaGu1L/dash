@@ -1,7 +1,5 @@
 import lazyLoadMathJax from '../utils/LazyLoader/mathjax';
 import React, {Component} from 'react';
-// /build/withPolyfill for IE11 support - https://github.com/maslianok/react-resize-detector/issues/144
-import ResizeDetector from 'react-resize-detector/build/withPolyfill';
 import {
     equals,
     filter,
@@ -14,7 +12,11 @@ import {
 } from 'ramda';
 import PropTypes from 'prop-types';
 import {graphPropTypes, graphDefaultProps} from '../components/Graph.react';
+
 /* global Plotly:true */
+
+import ResizeDetector from '../utils/ResizeDetector';
+import LoadingElement from '../utils/LoadingElement';
 
 /**
  * `autosize: true` causes Plotly.js to conform to the parent element size.
@@ -147,6 +149,8 @@ class PlotlyGraph extends Component {
         this._hasPlotted = false;
         this._prevGd = null;
         this._queue = Promise.resolve();
+
+        this.parentElement = React.createRef();
 
         this.bindEvents = this.bindEvents.bind(this);
         this.getConfig = this.getConfig.bind(this);
@@ -389,6 +393,7 @@ class PlotlyGraph extends Component {
 
         gd.classList.add('dash-graph--pending');
 
+        // Calling resize enables layout.autosize in plotly.js
         Plotly.Plots.resize(gd)
             .catch(() => {})
             .finally(() => gd.classList.remove('dash-graph--pending'));
@@ -471,10 +476,7 @@ class PlotlyGraph extends Component {
     shouldComponentUpdate(nextProps) {
         return (
             this.props.id !== nextProps.id ||
-            JSON.stringify(this.props.style) !==
-                JSON.stringify(nextProps.style) ||
-            JSON.stringify(this.props.loading_state) !==
-                JSON.stringify(nextProps.loading_state)
+            JSON.stringify(this.props.style) !== JSON.stringify(nextProps.style)
         );
     }
 
@@ -514,28 +516,33 @@ class PlotlyGraph extends Component {
     }
 
     render() {
-        const {className, id, style, loading_state} = this.props;
+        const {className, id, loading_state, style = {}} = this.props;
+        if (this.isResponsive(this.props)) {
+            style.height ||= '100%';
+        }
+
+        let Container = LoadingElement;
+        const containerProps = {
+            className,
+            id,
+            key: id,
+            ref: this.parentElement,
+            style,
+        };
+        if (!window.dash_component_api) {
+            Container = 'div';
+            containerProps['data-dash-is-loading'] =
+                loading_state?.is_loading || undefined;
+        }
 
         return (
-            <div
-                id={id}
-                key={id}
-                data-dash-is-loading={
-                    (loading_state && loading_state.is_loading) || undefined
-                }
-                className={className}
-                style={style}
-            >
+            <Container {...containerProps}>
                 <ResizeDetector
-                    handleHeight={true}
-                    handleWidth={true}
-                    refreshMode="debounce"
-                    refreshOptions={{trailing: true}}
-                    refreshRate={50}
                     onResize={this.graphResize}
+                    targets={[this.parentElement, this.gd]}
                 />
                 <div ref={this.gd} style={{height: '100%', width: '100%'}} />
-            </div>
+            </Container>
         );
     }
 }

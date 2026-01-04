@@ -29,20 +29,20 @@ import {
     IStoredCallback,
     IBlockedCallback,
     IPrioritizedCallback,
-    LongCallbackInfo,
+    BackgroundCallbackInfo,
     CallbackResponse,
     CallbackResponseData,
     SideUpdateOutput
 } from '../types/callbacks';
 import {isMultiValued, stringifyId, isMultiOutputProp} from './dependencies';
 import {urlBase} from './utils';
-import {getCSRFHeader, dispatchError} from '.';
+import {getCSRFHeader, dispatchError, setPaths} from '.';
 import {createAction, Action} from 'redux-actions';
 import {addHttpHeaders} from '../actions';
 import {notifyObservers, updateProps} from './index';
 import {CallbackJobPayload} from '../reducers/callbackJobs';
-import {handlePatch, isPatch} from './patch';
-import {getPath} from './paths';
+import {parsePatchProps} from './patch';
+import {computePaths, getPath} from './paths';
 
 import {requestDependencies} from './requestDependencies';
 
@@ -50,6 +50,8 @@ import {loadLibrary} from '../utils/libraries';
 
 import {parsePMCId} from './patternMatching';
 import {replacePMC} from './patternMatching';
+import {loaded, loading} from './loading';
+import {getComponentLayout} from '../wrapper/wrapping';
 
 export const addBlockedCallbacks = createAction<IBlockedCallback[]>(
     CallbackActionType.AddBlocked
@@ -121,22 +123,27 @@ function unwrapIfNotMulti(
 
     if (idProps.length !== 1) {
         if (!idProps.length) {
-            const isStr = typeof spec.id === 'string';
-            msg =
-                'A nonexistent object was used in an `' +
-                depType +
-                '` of a Dash callback. The id of this object is ' +
-                (isStr
-                    ? '`' + spec.id + '`'
-                    : JSON.stringify(spec.id) +
-                      (anyVals ? ' with MATCH values ' + anyVals : '')) +
-                ' and the property is `' +
-                spec.property +
-                (isStr
-                    ? '`. The string ids in the current layout are: [' +
-                      keys(paths.strs).join(', ') +
-                      ']'
-                    : '`. The wildcard ids currently available are logged above.');
+            if (spec.allow_optional) {
+                idProps = [{...spec, value: null}];
+                msg = '';
+            } else {
+                const isStr = typeof spec.id === 'string';
+                msg =
+                    'A nonexistent object was used in an `' +
+                    depType +
+                    '` of a Dash callback. The id of this object is ' +
+                    (isStr
+                        ? '`' + spec.id + '`'
+                        : JSON.stringify(spec.id) +
+                          (anyVals ? ' with MATCH values ' + anyVals : '')) +
+                    ' and the property is `' +
+                    spec.property +
+                    (isStr
+                        ? '`. The string ids in the current layout are: [' +
+                          keys(paths.strs).join(', ') +
+                          ']'
+                        : '`. The wildcard ids currently available are logged above.');
+            }
         } else {
             msg =
                 'Multiple objects were found for an `' +
@@ -202,7 +209,6 @@ function fillVals(
         // That's a real problem, so throw the first message as an error.
         refErr(errors, paths);
     }
-
     return inputVals;
 }
 
@@ -220,8 +226,16 @@ function refErr(errors: any, paths: any) {
 const getVals = (input: any) =>
     Array.isArray(input) ? pluck('value', input) : input.value;
 
-const zipIfArray = (a: any, b: any) =>
-    Array.isArray(a) ? zip(a, b) : [[a, b]];
+const zipIfArray = (a: any, b: any) => {
+    if (Array.isArray(a)) {
+        // For client-side callbacks with multiple Outputs, only return a single dash_clientside.no_update
+        if (b === (window as any).dash_clientside.no_update) {
+            return zip(a, [b]);
+        }
+        return zip(a, b);
+    }
+    return [[a, b]];
+};
 
 function cleanOutputProp(property: string) {
     return property.split('@')[0];
@@ -359,7 +373,8 @@ function updateComponent(component_id: any, props: any, cb: ICallbackPayload) {
         dispatch(
             updateProps({
                 props,
-                itempath: componentPath
+                itempath: componentPath,
+                renderType: 'callback'
             })
         );
         dispatch(notifyObservers({id: component_id, props}));
@@ -403,7 +418,39 @@ function sideUpdate(outputs: SideUpdateOutput, cb: ICallbackPayload) {
                 return acc;
             }, [] as any[])
             .forEach(([id, idProps]) => {
-                dispatch(updateComponent(id, idProps, cb));
+                const state = getState();
+
+                const componentPath = getPath(state.paths, id);
+                let oldComponent = {props: {}};
+                if (componentPath) {
+                    oldComponent = getComponentLayout(componentPath, state);
+                }
+
+                const oldProps = oldComponent?.props || {};
+
+                const patchedProps = parsePatchProps(idProps, oldProps);
+
+                dispatch(updateComponent(id, patchedProps, cb));
+
+                if (!componentPath) {
+                    // Component doesn't exist, doesn't matter just allow the
+                    // callback to continue.
+                    return;
+                }
+
+                dispatch(
+                    setPaths(
+                        computePaths(
+                            {
+                                ...oldComponent,
+                                props: {...oldComponent.props, ...patchedProps}
+                            },
+                            [...componentPath],
+                            state.paths,
+                            state.paths.events
+                        )
+                    )
+                );
             });
     };
 }
@@ -413,10 +460,9 @@ function handleServerside(
     hooks: any,
     config: any,
     payload: ICallbackPayload,
-    long: LongCallbackInfo | undefined,
+    background: BackgroundCallbackInfo | undefined,
     additionalArgs: [string, string, boolean?][] | undefined,
     getState: any,
-    output: string,
     running: any
 ): Promise<CallbackResponse> {
     if (hooks.request_pre) {
@@ -439,6 +485,7 @@ function handleServerside(
     const fetchCallback = () => {
         const headers = getCSRFHeader() as any;
         let url = `${urlBase(config)}_dash-update-component`;
+        let newBody = body;
 
         const addArg = (name: string, value: string) => {
             let delim = '?';
@@ -447,11 +494,19 @@ function handleServerside(
             }
             url = `${url}${delim}${name}=${value}`;
         };
-        if (cacheKey) {
-            addArg('cacheKey', cacheKey);
-        }
-        if (job) {
-            addArg('job', job);
+        if (cacheKey || job) {
+            if (cacheKey) addArg('cacheKey', cacheKey);
+            if (job) addArg('job', job);
+
+            // clear inputs as background callback doesnt need inputs, just verify for context
+            const tmpBody = JSON.parse(newBody);
+            for (let i = 0; i < tmpBody.inputs.length; i++) {
+                tmpBody.inputs[i]['value'] = null;
+            }
+            for (let i = 0; i < (tmpBody?.state || []).length; i++) {
+                tmpBody.state[i]['value'] = null;
+            }
+            newBody = JSON.stringify(tmpBody);
         }
 
         if (moreArgs) {
@@ -464,7 +519,7 @@ function handleServerside(
             mergeDeepRight(config.fetch, {
                 method: 'POST',
                 headers,
-                body
+                body: newBody
             })
         );
     };
@@ -561,7 +616,7 @@ function handleServerside(
                             cacheKey: data.cacheKey as string,
                             cancelInputs: data.cancel,
                             progressDefault: data.progressDefault,
-                            output
+                            output: JSON.stringify(payload.outputs)
                         };
                         dispatch(addCallbackJob(jobInfo));
                         job = data.job;
@@ -578,7 +633,7 @@ function handleServerside(
                         progressDefault = data.progressDefault;
                     }
 
-                    if (!long || data.response !== undefined) {
+                    if (!background || data.response !== undefined) {
                         if (data.dist) {
                             Promise.all(data.dist.map(loadLibrary)).then(() => {
                                 completeJob();
@@ -592,7 +647,9 @@ function handleServerside(
                         // Poll chain.
                         setTimeout(
                             handle,
-                            long.interval !== undefined ? long.interval : 500
+                            background.interval !== undefined
+                                ? background.interval
+                                : 500
                         );
                     }
                 });
@@ -684,8 +741,14 @@ export function executeCallback(
     dispatch: any,
     getState: any
 ): IExecutingCallback {
-    const {output, inputs, state, clientside_function, long, dynamic_creator} =
-        cb.callback;
+    const {
+        output,
+        inputs,
+        state,
+        clientside_function,
+        background,
+        dynamic_creator
+    } = cb.callback;
     try {
         const inVals = fillVals(paths, layout, cb, inputs, 'Input', true);
 
@@ -728,6 +791,12 @@ export function executeCallback(
         }
 
         const __execute = async (): Promise<CallbackResult> => {
+            const loadingOutputs = outputs.map(out => ({
+                path: getPath(paths, out.id),
+                property: out.property?.split('@')[0],
+                id: stringifyId(out.id)
+            }));
+            dispatch(loading(loadingOutputs));
             try {
                 const changedPropIds = keys<string>(cb.changedPropIds);
                 const parsedChangedPropsIds = changedPropIds.map(propId => {
@@ -749,12 +818,37 @@ export function executeCallback(
 
                 if (clientside_function) {
                     try {
-                        const data = await handleClientside(
+                        let data = await handleClientside(
                             dispatch,
                             clientside_function,
                             config,
                             payload
                         );
+                        // Patch methodology: always run through parsePatchProps for each output
+                        const currentLayout = getState().layout;
+                        flatten(outputs).forEach((out: any) => {
+                            const propName = cleanOutputProp(out.property);
+                            const outputPath = getPath(paths, out.id);
+                            const dataPath = [stringifyId(out.id), propName];
+                            const outputValue = path(dataPath, data);
+                            if (outputValue === undefined) {
+                                return;
+                            }
+                            const oldProps =
+                                path(
+                                    outputPath.concat(['props']),
+                                    currentLayout
+                                ) || {};
+                            const newProps = parsePatchProps(
+                                {[propName]: outputValue},
+                                oldProps
+                            );
+                            data = assocPath(
+                                dataPath,
+                                newProps[propName],
+                                data
+                            );
+                        });
                         return {data, payload};
                     } catch (error: any) {
                         return {error, payload};
@@ -766,9 +860,10 @@ export function executeCallback(
                 let lastError: any;
 
                 const additionalArgs: [string, string, boolean?][] = [];
+                const jsonOutput = JSON.stringify(payload.outputs);
                 values(getState().callbackJobs).forEach(
                     (job: CallbackJobPayload) => {
-                        if (cb.callback.output === job.output) {
+                        if (jsonOutput === job.output) {
                             // Terminate the old jobs that are not completed
                             // set as outdated for the callback promise to
                             // resolve and remove after.
@@ -802,10 +897,9 @@ export function executeCallback(
                             hooks,
                             newConfig,
                             payload,
-                            long,
+                            background,
                             additionalArgs.length ? additionalArgs : undefined,
                             getState,
-                            cb.callback.output,
                             cb.callback.running
                         );
 
@@ -813,26 +907,31 @@ export function executeCallback(
                             dispatch(addHttpHeaders(newHeaders));
                         }
                         // Layout may have changed.
+                        // DRY: Always run through parsePatchProps for each output
                         const currentLayout = getState().layout;
                         flatten(outputs).forEach((out: any) => {
                             const propName = cleanOutputProp(out.property);
                             const outputPath = getPath(paths, out.id);
-                            const previousValue = path(
-                                outputPath.concat(['props', propName]),
-                                currentLayout
-                            );
                             const dataPath = [stringifyId(out.id), propName];
                             const outputValue = path(dataPath, data);
-                            if (isPatch(outputValue)) {
-                                if (previousValue === undefined) {
-                                    throw new Error('Cannot patch undefined');
-                                }
-                                data = assocPath(
-                                    dataPath,
-                                    handlePatch(previousValue, outputValue),
-                                    data
-                                );
+                            if (outputValue === undefined) {
+                                return;
                             }
+                            const oldProps =
+                                path(
+                                    outputPath.concat(['props']),
+                                    currentLayout
+                                ) || {};
+                            const newProps = parsePatchProps(
+                                {[propName]: outputValue},
+                                oldProps
+                            );
+
+                            data = assocPath(
+                                dataPath,
+                                newProps[propName],
+                                data
+                            );
                         });
 
                         if (dynamic_creator) {
@@ -884,11 +983,12 @@ export function executeCallback(
                         break;
                     }
                 }
-
                 // we reach here when we run out of retries.
                 return {error: lastError, payload: null};
             } catch (error: any) {
                 return {error, payload: null};
+            } finally {
+                dispatch(loaded(loadingOutputs));
             }
         };
 

@@ -29,19 +29,23 @@ setup(
     install_requires=read_req_file("install"),
     python_requires=">=3.8",
     extras_require={
+        "async": read_req_file("async"),
         "ci": read_req_file("ci"),
         "dev": read_req_file("dev"),
         "testing": read_req_file("testing"),
         "celery": read_req_file("celery"),
         "diskcache": read_req_file("diskcache"),
-        "compress": read_req_file("compress")
+        "compress": read_req_file("compress"),
+        "cloud": read_req_file("cloud"),
+        "ag-grid": read_req_file("ag-grid")
     },
     entry_points={
         "console_scripts": [
             "dash-generate-components = "
             "dash.development.component_generator:cli",
             "renderer = dash.development.build_process:renderer",
-            "dash-update-components = dash.development.update_components:cli"
+            "dash-update-components = dash.development.update_components:cli",
+            "plotly = dash._plotly_cli:cli"
         ],
         "pytest11": ["dash = dash.testing.plugin"],
     },
